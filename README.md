@@ -40,7 +40,8 @@ AI 在窗口 A 里点按钮时，你可以照常操作窗口 B —— 它不抢�
   **自动降级**重试「前台 + `SendInput`」，调用方只调一次，回执里写明走了哪一级
   （`tier: "L2"`、`degraded: true`、`l1: {tier:"L1", verified:false}`）。
   `move` / `scroll` / `focus` / `run` / `quality` 这类与像素无关的动作不降级，
-  否则只会把光标抢到你脸上。
+  否则只会把光标抢到你脸上；`type` 走另一套规则（默认直接前台、永不重发），
+  详见下面的「文字输入」一节。
 - **每个动作都真回读。** 动作 → 等 `settleMs` → 再抓一帧 → 比字节；回执里 `verified`
   是实测结果，不是「写出去就算成功」。
 - **控制权是租约，不是开关。** `ttlMs`（默认 2s）内 AI 持有时才能动手；你一碰真实鼠标
@@ -120,7 +121,7 @@ powershell -File scripts\build-native.ps1 -Target All  # DesktopHost + Probe
 四个自检脚本，都不依赖 Harness 运行时：
 
 ```powershell
-node scripts\verify-workspace.mjs  # 租约状态机 + 工作台端到端（29 项，含真窗口点击）
+node scripts\verify-workspace.mjs  # 租约状态机 + 工作台端到端（31 项，含真窗口点击）
 node scripts\verify-host.mjs       # 路由 / WS / 工具 / 动作分发 / 空闲回收
 node scripts\verify-client.mjs     # slot 注册形状、渲染树、主题 token、字典完整性
 node scripts\verify-ui.mjs <url>   # 真 Harness 页面：面板真的渲染出来了吗（需 Edge）
@@ -185,6 +186,15 @@ node scripts\verify-ui.mjs <url>   # 真 Harness 页面：面板真的渲染出�
 
 不想降级（比如你正用着这台机器、不想被挪光标）就传 `"force": false, "degrade": false`，
 或者干脆只信 L1：`"degrade": false` 时回执会老实告诉你 `verified: false`。
+
+**文字输入（`type`）是这条规则的例外：默认直接走前台，而且永不重试。**
+实测后台 `WM_CHAR` 在记事本、资源管理器、系统对话框、计算器上**全部无反应**——后台投递
+文字等于什么都没做。所以 `type` 默认就落到前台 `SendInput`（`force` 视为 true），
+但**一次就够，绝不补发**：UWP 窗口（计算器、照片、设置…）收到 `WM_CHAR` 后会排队等
+自己的输入管线消化，此时重发 `SendInput` 会和排队中的字符叠加——实测打出过
+`77777777777777727*8 = 622,222,222,221,816`。想验证后台路径可以显式传 `"force": false`，
+那样回执带 `"hint": "no-visible-change"` 而不是偷偷再打一遍。
+`type` 的回读等待用独立的 `typeSettleMs`（默认 700ms，比 `settleMs` 长，给排队留时间）。
 
 ## 控制权怎么协作
 

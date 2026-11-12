@@ -148,6 +148,15 @@ const forced = await ws.act({ type: 'click', x: cx, y: cy }, { force: true })
 record('force 直接走 L2', forced.ok === true && forced.tier === 'L2' && !forced.degraded,
   `tier=${forced.tier} degraded=${Boolean(forced.degraded)} ver=${forced.verified}`)
 
+// ── 4b) 文字输入走前台单路，永不重发 ─────────────────────────
+// 后台 WM_CHAR 在 Win32 与 UWP 上都不生效（实测：记事本/资源管理器/对话框/计算器
+// 全部无反应），所以文字默认直接走前台 SendInput；但绝不重试 —— UWP 会把队列里的
+// WM_CHAR 与 SendInput 叠加，重发就打出 77777777777777727 这种重复串。
+const typed = await ws.act({ type: 'type', text: '1' })
+record('type 默认走前台且不重发', typed.ok === true && !typed.degraded,
+  `degraded=${Boolean(typed.degraded)} verified=${typed.verified} hint=${typed.hint ?? '-'}`)
+record('type 真的进了目标窗口', typed.verified === true, `verified=${typed.verified}`)
+
 // ── 5) 批量动作遇抢占能中止 ─────────────────────────────────
 // 把租约强行打成「用户持有」，验证后续动作被拒、并且批量立刻停在中途。
 ws.lease.release('test')
