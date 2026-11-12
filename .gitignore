@@ -1,0 +1,17 @@
+# native build output（首次运行时由 csc.exe 生成）
+native/bin/
+
+# 本地运行产物
+out/
+*.log
+*.jpg
+
+# 编辑器 / 系统
+.vs/
+.idea/
+node_modules/
+.DS_Store
+Thumbs.db
+
+# 文档配图要入库
+!docs/*.png

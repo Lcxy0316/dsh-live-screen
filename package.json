@@ -1,0 +1,69 @@
+{
+  "name": "dsh-live-screen",
+  "version": "0.1.0",
+  "description": "See and drive the local Windows desktop from DeepSeek Harness: native screen capture, same-origin live preview panel, and a live_screen tool for the model.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/client.js",
+    "lib/capture.js",
+    "lib/actions.js",
+    "lib/ws.js",
+    "native/ScreenHub.cs",
+    "scripts/build-native.ps1",
+    "standalone/view.html",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "README.md"
+  ],
+  "scripts": {
+    "build:native": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-native.ps1",
+    "test": "node scripts/verify-host.mjs && node scripts/verify-client.mjs",
+    "test:ui": "node scripts/verify-ui.mjs",
+    "selftest": "node scripts/selftest.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Lcxy0316/dsh-live-screen.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Lcxy0316/dsh-live-screen/issues"
+  },
+  "homepage": "https://github.com/Lcxy0316/dsh-live-screen#readme",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "screen-capture",
+    "computer-use",
+    "gui-agent",
+    "windows"
+  ],
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "os": [
+    "win32"
+  ],
+  "license": "MIT"
+}
