@@ -141,13 +141,15 @@ try {
   await sleep(2500)
 
   // 3) 主区里应出现画面描述/连接状态文案。
+  //    状态词来自 lib/client.js 的 MESSAGES：画面在流 / 未连接 / 连接中（离线也算合法状态）；
+  //    工作台版还会显示租约持有者（AI 在操作 / 你或别人在操作 / 无人操作）。
   const panelDom = await evaluate(cdp, `(() => {
     const text = document.body.innerText || ''
     const canvas = document.querySelectorAll('canvas').length
     return {
       canvas,
       hasTitle: text.includes('实时画面') || text.includes('Live Screen'),
-      hasState: /推流中|连接|Connecting|连接中|已连接|离线|Offline|Connected|Streaming/.test(text),
+      hasState: /画面在流|未连接|连接中|无人操作|AI 在操作|在操作|Streaming|Disconnected|Connecting|Nobody driving/.test(text),
       snippet: text.slice(0, 400)
     }
   })()`)

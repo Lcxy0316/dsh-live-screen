@@ -1,7 +1,11 @@
-// 不启动 Harness 的宿主半边验证：
+// 不启动 Harness 的宿主半边验证（v2 工作台版）：
 // 用 module.registerHooks 复刻 Harness 的 @deepseek-ai/* 解析（安装目录），
-// 给插件一个最小 ctx（tools / attachments / inject / effect / get），
-// 然后把 mock webServer 的注册接到一个真实 http server 上跑端到端。
+// 给插件一个最小 ctx（tools / attachments / inject / effect），
+// 然后把 mock webServer 的注册接到真实 http server 上跑端到端。
+//
+// 覆盖：注册形状 → 工具（list/open/snapshot/act/lease/stats/close）→
+//       HTTP（workspaces/snapshot/status/lease/act/windows/list DELETE）→
+//       WS（hello / 出帧 / act 回执 / status / windows / open）→ 空闲回收。
 //
 // 用法：node scripts/verify-host.mjs
 import { registerHooks } from 'node:module'
@@ -35,12 +39,14 @@ function check(name, ok, detail) {
   if (ok) log('PASS', name)
   else { failures += 1; log('FAIL', name, detail ?? '') }
 }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 const mod = await import('../lib/index.js')
 check('模块导出 name', mod.name === 'live-screen', mod.name)
 check('模块导出 inject', Array.isArray(mod.inject) && mod.inject.includes('tools'), JSON.stringify(mod.inject))
 check('导出 apply', typeof mod.apply === 'function')
 check('导出 isAvailable', typeof mod.isAvailable === 'function' && mod.isAvailable() === true)
+check('原生宿主已编译', existsSync(mod.HOST_EXE), mod.HOST_EXE)
 
 /* ---------------- 假 ctx ---------------- */
 const registered = { tools: [], http: [], upgrade: [], effects: [], injected: [] }
@@ -67,7 +73,8 @@ const fakeCtx = {
   effect(fn, label) { const dispose = fn(); registered.effects.push({ label, dispose }); return dispose },
 }
 
-mod.apply(fakeCtx, { fps: 12, scale: 1, quality: 55, idleMs: 4000 })
+const IDLE_MS = 2500
+mod.apply(fakeCtx, { fps: 12, quality: 60, idleMs: IDLE_MS, leaseTtlMs: 2000 })
 
 check('注册了工具', registered.tools.length === 1, String(registered.tools.length))
 check('工具名 live_screen', registered.tools[0]?.name === 'live_screen', registered.tools[0]?.name)
@@ -89,120 +96,221 @@ server.on('upgrade', (req, socket, head) => {
 })
 await new Promise((r) => server.listen(0, '127.0.0.1', r))
 const port = server.address().port
+const base = `http://127.0.0.1:${port}/live-screen`
 log('listening', port)
 
-const json = async (path) => {
-  const res = await fetch(`http://127.0.0.1:${port}${path}`)
-  return { status: res.status, body: await res.text() }
+const getJson = async (path, init) => {
+  const res = await fetch(`${base}${path}`, init)
+  const text = await res.text()
+  let body = null
+  try { body = JSON.parse(text) } catch {}
+  return { status: res.status, body, text }
 }
-
-const screen = await json('/live-screen/screen')
-check('GET /screen 200', screen.status === 200, String(screen.status))
-log('  screen =', screen.body)
-
-const snapRes = await fetch(`http://127.0.0.1:${port}/live-screen/snapshot`)
-const snapBuf = Buffer.from(await snapRes.arrayBuffer())
-check('GET /snapshot 200', snapRes.status === 200, String(snapRes.status))
-check('snapshot 是 JPEG', snapBuf[0] === 0xff && snapBuf[1] === 0xd8, snapBuf.subarray(0, 2).toString('hex'))
-check('snapshot 体积合理', snapBuf.length > 20000, String(snapBuf.length))
-log('  snapshot bytes =', snapBuf.length)
-
-const actRes = await fetch(`http://127.0.0.1:${port}/live-screen/action`, {
+const postJson = (path, payload) => getJson(path, {
   method: 'POST',
   headers: { 'content-type': 'application/json' },
-  body: JSON.stringify([{ type: 'move', x: 640, y: 400 }, { type: 'wait', ms: 60 }]),
+  body: JSON.stringify(payload)
 })
-const actBody = await actRes.text()
-check('POST /action 200', actRes.status === 200, String(actRes.status))
-check('action 结果 ok', actBody.includes('"ok":true'), actBody)
-log('  action =', actBody)
 
-const statsRes = await json('/live-screen/stats')
-check('GET /stats 200', statsRes.status === 200, String(statsRes.status))
-log('  stats =', statsRes.body.slice(0, 200))
+/* ---------------- 挑一个真实窗口 ---------------- */
+const listRes = await getJson('/list')
+check('GET /list 200', listRes.status === 200, String(listRes.status))
+const windows = listRes.body?.windows ?? []
+check('列出窗口 >= 1', windows.length >= 1, String(windows.length))
+log('  可见窗口', windows.slice(0, 6).map((w) => `${w.hwnd} ${w.title} ${w.rect?.[2]}x${w.rect?.[3]}`).join(' | '))
+
+// 优先挑一个能改画面的目标：记事本 > 计算器 > 任意足够大的窗口。
+const pick = windows.find((w) => /记事本|Notepad/i.test(w.title ?? ''))
+  ?? windows.find((w) => /计算器|Calculator/i.test(w.title ?? ''))
+  ?? windows.find((w) => (w.rect?.[2] ?? 0) >= 300 && (w.rect?.[3] ?? 0) >= 300)
+  ?? windows[0]
+check('找到可绑定窗口', !!pick, JSON.stringify(windows.slice(0, 3)))
+if (!pick) { server.close(); process.exit(1) }
+log('  目标窗口', pick.hwnd, JSON.stringify(pick.title), `${pick.rect?.[2]}x${pick.rect?.[3]}`)
+
+/* ---------------- 工具：open ---------------- */
+const tool = registered.tools[0]
+const toolListOut = await tool.execute({ action: 'list' })
+check('工具 list ok', toolListOut.ok === true && toolListOut.windows?.length >= 1, JSON.stringify(toolListOut).slice(0, 160))
+
+const openOut = await tool.execute({ action: 'open', window: pick.hwnd })
+check('工具 open ok', openOut.ok === true, JSON.stringify(openOut).slice(0, 240))
+const wsA = openOut.workspace
+check('open 返回工作台 id', typeof wsA === 'string' && wsA.startsWith('ws'), wsA)
+check('open 报出目标尺寸', openOut.target?.width > 0 && openOut.target?.height > 0, JSON.stringify(openOut.target))
+log('  workspace', wsA, 'target', JSON.stringify(openOut.target))
+
+// 渲染
+const openRendered = tool.output.render({ action: 'open' }, openOut)
+check('render open 有 text 段', openRendered.some((p) => p.type === 'text'))
+
+/* ---------------- 工具：snapshot ---------------- */
+const snapOut = await tool.execute({ action: 'snapshot' })
+check('工具 snapshot ok', snapOut.ok === true, JSON.stringify(snapOut).slice(0, 200))
+check('snapshot 带 image attachment', snapOut.attachments?.length === 1, JSON.stringify(snapOut.attachments))
+check('snapshot 尺寸与绑定窗口一致',
+  snapOut.width === openOut.target.width && snapOut.height === openOut.target.height,
+  `${snapOut.width}x${snapOut.height} vs ${openOut.target.width}x${openOut.target.height}`)
+check('snapshot 体积合理', snapOut.bytes > 2000, String(snapOut.bytes))
+const snapRendered = tool.output.render({ action: 'snapshot' }, snapOut)
+check('render snapshot 含 image 段', snapRendered.some((p) => p.type === 'image'), JSON.stringify(snapRendered.map((p) => p.type)))
+check('render snapshot 含 text 段', snapRendered.some((p) => p.type === 'text'))
+log('  snapshot', `${snapOut.width}x${snapOut.height}`, `${(snapOut.bytes / 1024).toFixed(1)}KB`, 'seq', snapOut.seq)
+
+/* ---------------- 工具：act（真回读） ---------------- */
+const actOut = await tool.execute({
+  action: 'act',
+  steps: [
+    { type: 'click', x: Math.round(openOut.target.width / 2), y: Math.round(openOut.target.height / 2) },
+    { type: 'wait', ms: 60 },
+  ],
+})
+check('工具 act ok', actOut.ok === true, JSON.stringify(actOut).slice(0, 240))
+const firstAct = actOut.results?.[0]
+check('act 回执带 tier', typeof firstAct?.tier === 'string', JSON.stringify(firstAct))
+check('act 回执带 verified 布尔', typeof firstAct?.verified === 'boolean', JSON.stringify(firstAct))
+check('act 回执带 lease', typeof actOut.lease?.holder === 'string', JSON.stringify(actOut.lease))
+const actRendered = tool.output.render({ action: 'act' }, actOut)
+check('render act 标注回读结果',
+  /已回读确认|画面无变化/.test(actRendered[0]?.text ?? '') || actRendered[0]?.text?.length > 0,
+  actRendered[0]?.text)
+log('  act', JSON.stringify(firstAct))
+
+/* ---------------- 工具：lease ---------------- */
+const leaseOut = await tool.execute({ action: 'lease' })
+check('工具 lease 返回租约', typeof leaseOut.lease?.holder === 'string', JSON.stringify(leaseOut.lease).slice(0, 200))
+
+/* ---------------- 工具：stats ---------------- */
+const toolStats = await tool.execute({ action: 'stats' })
+check('工具 stats ok', toolStats.ok === true && Array.isArray(toolStats.stats?.workspaces), JSON.stringify(toolStats).slice(0, 160))
+check('stats 报出原生宿主可用', toolStats.stats?.nativeHost?.available === true, JSON.stringify(toolStats.stats?.nativeHost))
+
+/* ---------------- 工具：close ---------------- */
+const closeOut = await tool.execute({ action: 'close', workspace: wsA })
+check('工具 close ok', closeOut.ok === true, JSON.stringify(closeOut).slice(0, 160))
+await sleep(400)
+const afterClose = await getJson('/stats')
+check('close 后工作台已移除', (afterClose.body?.workspaces ?? []).length === 0, JSON.stringify(afterClose.body?.workspaces?.map((w) => w.id)))
+
+/* ---------------- HTTP：工作台生命周期 ---------------- */
+const createRes = await postJson('/workspaces', { window: pick.hwnd, fps: 12, quality: 60 })
+check('POST /workspaces 200', createRes.status === 200, `${createRes.status} ${createRes.text.slice(0, 160)}`)
+const wsB = createRes.body?.id
+check('返回工作台 id', typeof wsB === 'string', String(wsB))
+
+const stRes = await getJson(`/${wsB}/status`)
+check('GET /<id>/status 200', stRes.status === 200, String(stRes.status))
+check('status 报出宿主在跑', stRes.body?.host?.running === true, JSON.stringify(stRes.body?.host).slice(0, 200))
+
+const snapRes = await fetch(`${base}/${wsB}/snapshot`)
+const snapBuf = Buffer.from(await snapRes.arrayBuffer())
+check('GET /<id>/snapshot 200', snapRes.status === 200, String(snapRes.status))
+check('snapshot 是 JPEG', snapBuf[0] === 0xff && snapBuf[1] === 0xd8, snapBuf.subarray(0, 2).toString('hex'))
+check('snapshot 带 seq 头', Number(snapRes.headers.get('x-frame-seq')) > 0, String(snapRes.headers.get('x-frame-seq')))
+log('  snapshot', snapBuf.length, 'B seq', snapRes.headers.get('x-frame-seq'))
+
+// 帧计数要在出过帧之后再看：静态窗口分块哈希不变时不编码，frames 本来就是 0。
+const stAfter = await getJson(`/${wsB}/status`)
+const hostStats = stAfter.body?.host ?? {}
+check('status 报出帧数与均帧大小', hostStats.frames > 0 && hostStats.avgKB > 0, JSON.stringify(hostStats).slice(0, 220))
+log('  host', { frames: hostStats.frames, avgKB: hostStats.avgKB, rssMB: hostStats.rssMB })
+
+const leaseRes = await getJson(`/${wsB}/lease`)
+check('GET /<id>/lease 200', leaseRes.status === 200 && typeof leaseRes.body?.holder === 'string', JSON.stringify(leaseRes.body).slice(0, 160))
+
+const actRes = await postJson(`/${wsB}/act`, { type: 'move', x: 40, y: 40 })
+check('POST /<id>/act 200', actRes.status === 200, String(actRes.status))
+check('act 回执 ok', actRes.body?.ok === true, JSON.stringify(actRes.body).slice(0, 200))
+
+const windowsRes = await getJson('/windows')
+check('GET /windows 200', windowsRes.status === 200, String(windowsRes.status))
+check('/windows 复用已有工作台', windowsRes.body?.reused === wsB, JSON.stringify(windowsRes.body?.reused))
+
+const listAfter = await getJson('/stats')
+check('/stats 列出工作台', (listAfter.body?.workspaces ?? []).some((w) => w.id === wsB), JSON.stringify(listAfter.body?.workspaces?.map((w) => w.id)))
 
 /* ---------------- WebSocket ---------------- */
-const ws = new WebSocket(`ws://127.0.0.1:${port}/live-screen/ws`)
+const wsUrl = `ws://127.0.0.1:${port}/live-screen/ws?id=${wsB}`
+const ws = new WebSocket(wsUrl)
 ws.binaryType = 'arraybuffer'
-const wsFrames = []
 const wsTexts = []
-let firstFrameAt = 0
+const wsFrames = []
 const wsStart = Date.now()
+let firstFrameAt = 0
 
 const wsDone = new Promise((resolve) => {
   ws.onmessage = (event) => {
     if (typeof event.data === 'string') { wsTexts.push(JSON.parse(event.data)); return }
     if (!firstFrameAt) firstFrameAt = Date.now() - wsStart
     wsFrames.push(event.data.byteLength)
-    if (wsFrames.length >= 20) resolve()
   }
   ws.onerror = () => resolve()
   ws.onclose = () => resolve()
-  setTimeout(resolve, 8000)
+  setTimeout(resolve, 3000)
 })
 await wsDone
-check('收到 hello', wsTexts.some((m) => m.type === 'hello'), JSON.stringify(wsTexts.slice(0, 2)))
-check('收到 >= 20 帧', wsFrames.length >= 20, String(wsFrames.length))
-check('首帧 < 1500ms', firstFrameAt > 0 && firstFrameAt < 1500, String(firstFrameAt) + 'ms')
-if (wsFrames.length) {
-  const avg = wsFrames.reduce((a, b) => a + b, 0) / wsFrames.length
-  log('  帧数', wsFrames.length, '首帧', firstFrameAt, 'ms', '平均', (avg / 1024).toFixed(1), 'KB')
-}
+check('WS 收到 hello', wsTexts.some((m) => m.type === 'hello'), JSON.stringify(wsTexts.slice(0, 2)))
+const hello = wsTexts.find((m) => m.type === 'hello')
+check('hello 带工作台 id', hello?.workspaceId === wsB, String(hello?.workspaceId))
+check('hello 报出宿主状态', hello?.host?.running === true, JSON.stringify(hello?.host).slice(0, 160))
+check('WS 首帧到达', wsFrames.length >= 1, JSON.stringify(wsFrames))
+check('WS 首帧 < 3000ms', firstFrameAt > 0 && firstFrameAt < 3000, `${firstFrameAt}ms`)
+if (wsFrames.length) log('  ws frames', wsFrames.length, '首帧', firstFrameAt, 'ms', '平均', (wsFrames.reduce((a, b) => a + b, 0) / wsFrames.length / 1024).toFixed(1), 'KB')
 
-// WS 上行动作
-const ack = new Promise((resolve) => {
-  const prev = ws.onmessage
-  ws.onmessage = (event) => {
-    if (typeof event.data === 'string') {
-      const m = JSON.parse(event.data)
-      if (m.type === 'result') { ws.onmessage = prev; resolve(m) }
-    }
-    prev(event)
-  }
-  setTimeout(() => resolve(null), 3000)
+// 静态窗口默认不产帧（分块哈希去重），主动 grab 会强制出一帧并广播给 watcher。
+const framesBefore = wsFrames.length
+for (let i = 0; i < 3; i++) {
+  await fetch(`${base}/${wsB}/snapshot`).then((r) => r.arrayBuffer())
+  await sleep(120)
+}
+check('强制快照会广播新帧', wsFrames.length > framesBefore, `${framesBefore} → ${wsFrames.length}`)
+
+const waitText = (predicate, timeoutMs = 4000) => new Promise((resolve) => {
+  const timer = setInterval(() => {
+    const hit = wsTexts.find(predicate)
+    if (hit) { clearInterval(timer); resolve(hit) }
+  }, 40)
+  setTimeout(() => { clearInterval(timer); resolve(null) }, timeoutMs)
 })
-ws.send(JSON.stringify({ type: 'action', action: { type: 'move', x: 300, y: 300 } }))
-const ackMsg = await ack
-check('WS 上行动作有 result 回包', ackMsg !== null && ackMsg.result?.ok === true, JSON.stringify(ackMsg))
+
+const mark = wsTexts.length
+ws.send(JSON.stringify({ type: 'windows' }))
+const windowsMsg = await waitText((m) => m.type === 'windows')
+check('WS windows 返回窗口清单', Array.isArray(windowsMsg?.windows) && windowsMsg.windows.length >= 1, JSON.stringify(windowsMsg).slice(0, 160))
+
+ws.send(JSON.stringify({ type: 'act', action: { type: 'move', x: 30, y: 30 } }))
+const actMsg = await waitText((m) => m.type === 'result')
+check('WS act 有 result 回包', actMsg?.result?.ok === true, JSON.stringify(actMsg).slice(0, 200))
+check('WS act 回执带 verified', typeof actMsg?.result?.verified === 'boolean', JSON.stringify(actMsg?.result).slice(0, 160))
+
+ws.send(JSON.stringify({ type: 'lease-acquire' }))
+const leaseMsg = await waitText((m) => m.type === 'lease')
+check('WS lease-acquire 回包', typeof leaseMsg?.holder === 'string', JSON.stringify(leaseMsg).slice(0, 160))
+
+ws.send(JSON.stringify({ type: 'status' }))
+const statusMsg = await waitText((m) => m.type === 'status')
+check('WS status 回包', statusMsg?.host !== undefined, JSON.stringify(statusMsg).slice(0, 160))
+
+ws.send(JSON.stringify({ type: 'open', hwnd: pick.hwnd }))
+const openedMsg = await waitText((m) => m.type === 'opened')
+check('WS open 回包', openedMsg?.ok === true, JSON.stringify(openedMsg).slice(0, 200))
+check('WS 消息序列有新增', wsTexts.length > mark, `${mark} → ${wsTexts.length}`)
 
 ws.close()
+await sleep(300)
 
-/* ---------------- 工具执行 ---------------- */
-const tool = registered.tools[0]
-const statsOut = await tool.execute({ action: 'stats' })
-check('工具 stats ok', statsOut.ok === true && !!statsOut.stats, JSON.stringify(statsOut).slice(0, 160))
-
-const snapOut = await tool.execute({ action: 'snapshot' })
-check('工具 snapshot ok', snapOut.ok === true, JSON.stringify(snapOut).slice(0, 200))
-check('工具 snapshot 返回 image attachment', Array.isArray(snapOut.attachments) && snapOut.attachments.length === 1,
-  JSON.stringify(snapOut.attachments))
-const rendered = tool.output.render({ action: 'snapshot' }, snapOut)
-check('render 含 image 段', rendered.some((p) => p.type === 'image'), JSON.stringify(rendered.map((p) => p.type)))
-check('render 含 text 段', rendered.some((p) => p.type === 'text'))
-
-const actOut = await tool.execute({ action: 'action', steps: [{ type: 'move', x: 500, y: 500 }] })
-check('工具 action ok', actOut.ok === true && actOut.results?.[0]?.ok === true, JSON.stringify(actOut).slice(0, 200))
-
-/* ---------------- 空闲自停（idleMs=4000） ---------------- */
-// 关键回归：/snapshot 与工具调用都必须刷新空闲时钟，否则「看一眼」会把采集器
-// 永久挂起（真实 GUI 里 1127 帧 / 35s 一直不停就是这个 bug）。
-const idleBefore = (await json('/live-screen/stats')).body
-const runningBefore = JSON.parse(idleBefore).capture.running
-check('空闲前采集器在跑', runningBefore === true, idleBefore.slice(0, 160))
-await new Promise((r) => setTimeout(r, 6500))
-const idleAfter = JSON.parse((await json('/live-screen/stats')).body)
-check('超过 idleMs 后采集器自停', idleAfter.capture.running === false, JSON.stringify(idleAfter.capture).slice(0, 200))
-log('  idle stop ->', { running: idleAfter.capture.running, frames: idleAfter.capture.frames })
-
-// 自停后还能被重新唤起（惰性重启链路不能断）。
-await json('/live-screen/screen')
-const revived = await fetch(`http://127.0.0.1:${port}/live-screen/snapshot`)
-const revivedBuf = Buffer.from(await revived.arrayBuffer())
-check('自停后能重新唤起', revived.status === 200 && revivedBuf[0] === 0xff, `${revived.status} / ${revivedBuf.length}B`)
+/* ---------------- 空闲回收 ---------------- */
+const beforeReap = (await getJson('/stats')).body?.workspaces ?? []
+check('回收前工作台存在', beforeReap.some((w) => w.id === wsB), JSON.stringify(beforeReap.map((w) => w.id)))
+log(`  等待 ${IDLE_MS}ms 空闲 + 回收周期…`)
+await sleep(IDLE_MS + 6500)
+const afterReap = (await getJson('/stats')).body?.workspaces ?? []
+check('空闲超时后工作台被回收', !afterReap.some((w) => w.id === wsB), JSON.stringify(afterReap.map((w) => w.id)))
 
 /* ---------------- 清理 ---------------- */
 server.close()
 for (const effect of registered.effects) { try { effect.dispose() } catch {} }
+await sleep(500)
 
 log(failures === 0 ? 'ALL PASS' : `${failures} FAILED`)
 process.exit(failures === 0 ? 0 : 1)

@@ -1,35 +1,35 @@
 {
   "name": "dsh-live-screen",
-  "version": "0.1.0",
-  "description": "See and drive the local Windows desktop from DeepSeek Harness: native screen capture, same-origin live preview panel, and a live_screen tool for the model.",
+  "version": "0.2.0",
+  "description": "Isolated window workspaces for the local Windows desktop in DeepSeek Harness: per-window capture, background injection with foreground fallback, control lease arbitration, and a live preview panel.",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
     ".": "./lib/index.js",
     "./client": "./lib/client.js",
-    "./package.json": "./package.json",
-    "./locale/*.json": "./locale/*.json"
+    "./package.json": "./package.json"
   },
   "files": [
     "lib/index.js",
     "lib/client.js",
-    "lib/capture.js",
-    "lib/actions.js",
+    "lib/host.js",
+    "lib/lease.js",
+    "lib/workspace.js",
     "lib/ws.js",
-    "native/ScreenHub.cs",
+    "native/DesktopHost.cs",
+    "native/Probe.cs",
     "scripts/*.mjs",
     "scripts/build-native.ps1",
-    "standalone/view.html",
     "cordis.patch.yml",
-    "locale/*.json",
+    "docs/panel.png",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
     "build:native": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-native.ps1",
-    "test": "node scripts/verify-host.mjs && node scripts/verify-client.mjs",
+    "test": "node scripts/verify-workspace.mjs && node scripts/verify-host.mjs && node scripts/verify-client.mjs",
     "test:ui": "node scripts/verify-ui.mjs",
-    "selftest": "node scripts/selftest.mjs",
+    "probe": "node scripts/probe-host.mjs",
     "push:api": "node scripts/push-api.mjs"
   },
   "repository": {
@@ -60,6 +60,7 @@
     "screen-capture",
     "computer-use",
     "gui-agent",
+    "window-workspace",
     "windows"
   ],
   "engines": {

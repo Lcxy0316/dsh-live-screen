@@ -137,6 +137,31 @@ check('没有字面色泄漏进样式', !styles.some((s) => Object.values(s).som
 check('渲染出 canvas', JSON.stringify(tree).includes('"canvas"'))
 check('渲染出输入框', JSON.stringify(tree).includes('"input"'))
 
+/* ---------------- v2：租约 / 窗口选择 / 回读标记 ---------------- */
+const dict = dicts[0]?.dict ?? {}
+const zh = dict.zh ?? {}
+const allText = texts.join(' | ')
+check('顶栏显示租约持有者', allText.includes(zh.holderNone ?? 'holderNone'), allText.slice(0, 200))
+check('未绑定窗口时给出提示', allText.includes(zh.noWindow ?? 'noWindow'))
+check('提交按钮存在', allText.includes(zh.send ?? 'send'))
+check('提示文案存在', allText.includes(zh.hint ?? 'hint'))
+check('控制开关显示「只看不动」', allText.includes(zh.controlOff ?? 'controlOff'))
+
+const need = [
+  'panel', 'title', 'subtitle', 'live', 'offline', 'connecting',
+  'holderAi', 'holderUser', 'holderNone', 'preempted',
+  'verified', 'unverified', 'handback', 'pickWindow', 'noWindow',
+]
+for (const key of need) {
+  check(`字典含 ${key}（zh+en）`, !!dict.zh?.[key] && !!dict.en?.[key], `${dict.zh?.[key]} / ${dict.en?.[key]}`)
+}
+
+check('租约三种持有者文案互不相同',
+  new Set([zh.holderAi, zh.holderUser, zh.holderNone]).size === 3)
+
+check('抢占提示说明了「停手后才能接回」', String(zh.preempted).includes('停手'))
+check('回读失败文案不是「成功」', !String(zh.unverified).includes('成功'))
+
 /* ---------------- 卸载清理 ---------------- */
 for (const e of effects) { try { e.d() } catch {} }
 
