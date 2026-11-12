@@ -18,16 +18,19 @@
     "lib/ws.js",
     "native/ScreenHub.cs",
     "scripts/build-native.ps1",
+    "scripts/push-api.mjs",
     "standalone/view.html",
     "cordis.patch.yml",
     "locale/*.json",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "build:native": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-native.ps1",
     "test": "node scripts/verify-host.mjs && node scripts/verify-client.mjs",
     "test:ui": "node scripts/verify-ui.mjs",
-    "selftest": "node scripts/selftest.mjs"
+    "selftest": "node scripts/selftest.mjs",
+    "push:api": "node scripts/push-api.mjs"
   },
   "repository": {
     "type": "git",
