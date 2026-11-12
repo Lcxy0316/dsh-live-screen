@@ -44,17 +44,19 @@
 
 | 项 | 实测 |
 | --- | --- |
-| Harness 宿主插件增量 | ~35 MB RSS |
-| ScreenHub.exe | ~27 MB private / ~41 MB working set |
+| Harness 宿主插件增量 | ~35 MB RSS（采集器未起时接近 0） |
+| ScreenHub.exe | 26.9 MB private / 40.5 MB working set |
+| ScreenHub.exe CPU | 0.86%（16 逻辑核满载口径）≈ 0.14 个核 |
 | 面板（浏览器内） | ~40 MB（与已开的 Harness 页面共享进程） |
 | 单帧 | ~105 KB |
 | 原始码率 | ~9.7 Mbps（本机回环，不占物理网卡） |
 | 首帧延迟 | 8 ms |
 | 帧耗时预算 | 采集 ~20 ms + JPEG ~6 ms，1080p 上限约 35 fps |
+| GPU 显存 | 0（JPEG 走 CPU，NVENC 未启用） |
 
-**总计约 100 MB**，不碰 GPU 显存（JPEG 走 CPU；显存留给别的活）。
+**总计约 100 MB、0.15 个核**，不碰 GPU 显存（留给别的活）。
 
-部署适配结论：**适合**。16 GB 机器上 100 MB 属于噪声级；真正的开销是 Harness 页面本身。若内存吃紧，把 `scale` 降到 `0.5`（960×540，单帧 ~30 KB）或 `fps` 降到 6，采集栈几乎不变，CPU 占用线性下降。低于 8 GB 物理内存不建议开面板常驻。
+部署适配结论：**适合**。16 GB 机器上 100 MB 属于噪声级；真正的开销是 Harness 页面本身（实测页面进程 0.6–1.6 GB，比采集栈大一个数量级）。若内存吃紧，把 `scale` 降到 `0.5`（960×540，单帧 ~30 KB）或 `fps` 降到 6，采集栈几乎不变，CPU 占用线性下降。低于 8 GB 物理内存不建议开面板常驻。
 
 ## 安装
 
@@ -87,7 +89,7 @@ pwsh -File scripts\build-native.ps1
 仓库自带四个自检脚本，都不依赖 Harness 运行时：
 
 ```powershell
-node scripts\verify-host.mjs     # 宿主半边：路由、WS、工具、动作分发（24 项）
+node scripts\verify-host.mjs     # 宿主半边：路由、WS、工具、动作分发、空闲自停（31 项）
 node scripts\verify-client.mjs   # 浏览器半边：slot 注册形状、渲染树、主题 token（23 项）
 node scripts\wstest.mjs <ws-url> # 裸 WS 压测：帧数 / fps / 码率 / 首帧延迟
 node scripts\verify-ui.mjs <url> # 真 Harness 页面：面板真的渲染出来了吗（需 Edge）

@@ -67,7 +67,7 @@ const fakeCtx = {
   effect(fn, label) { const dispose = fn(); registered.effects.push({ label, dispose }); return dispose },
 }
 
-mod.apply(fakeCtx, { fps: 12, scale: 1, quality: 55 })
+mod.apply(fakeCtx, { fps: 12, scale: 1, quality: 55, idleMs: 4000 })
 
 check('注册了工具', registered.tools.length === 1, String(registered.tools.length))
 check('工具名 live_screen', registered.tools[0]?.name === 'live_screen', registered.tools[0]?.name)
@@ -182,6 +182,23 @@ check('render 含 text 段', rendered.some((p) => p.type === 'text'))
 
 const actOut = await tool.execute({ action: 'action', steps: [{ type: 'move', x: 500, y: 500 }] })
 check('工具 action ok', actOut.ok === true && actOut.results?.[0]?.ok === true, JSON.stringify(actOut).slice(0, 200))
+
+/* ---------------- 空闲自停（idleMs=4000） ---------------- */
+// 关键回归：/snapshot 与工具调用都必须刷新空闲时钟，否则「看一眼」会把采集器
+// 永久挂起（真实 GUI 里 1127 帧 / 35s 一直不停就是这个 bug）。
+const idleBefore = (await json('/live-screen/stats')).body
+const runningBefore = JSON.parse(idleBefore).capture.running
+check('空闲前采集器在跑', runningBefore === true, idleBefore.slice(0, 160))
+await new Promise((r) => setTimeout(r, 6500))
+const idleAfter = JSON.parse((await json('/live-screen/stats')).body)
+check('超过 idleMs 后采集器自停', idleAfter.capture.running === false, JSON.stringify(idleAfter.capture).slice(0, 200))
+log('  idle stop ->', { running: idleAfter.capture.running, frames: idleAfter.capture.frames })
+
+// 自停后还能被重新唤起（惰性重启链路不能断）。
+await json('/live-screen/screen')
+const revived = await fetch(`http://127.0.0.1:${port}/live-screen/snapshot`)
+const revivedBuf = Buffer.from(await revived.arrayBuffer())
+check('自停后能重新唤起', revived.status === 200 && revivedBuf[0] === 0xff, `${revived.status} / ${revivedBuf.length}B`)
 
 /* ---------------- 清理 ---------------- */
 server.close()
