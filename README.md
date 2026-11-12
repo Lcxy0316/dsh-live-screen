@@ -130,6 +130,14 @@ node scripts\verify-ui.mjs <url>   # 真 Harness 页面：面板真的渲染出�
 `verify-workspace.mjs` 会真的启动 `DesktopHost.exe`、绑定一个可见窗口、点一下、
 比对像素，所以它是唯一需要「有交互式桌面 + 至少一个窗口」的脚本。
 
+真机跑通的样子（工作台把 `1234*5678` 打进计算器并按下等号，回读确认画面变了）：
+
+![点按钮 + 输入 + 回车，结果 7,006,652](docs/demo.png)
+
+这一次点击走了完整降级链：`click` 的 L1 后台投递对 UWP 计算器无效，
+插件自己重试 L2（前台 `SendInput`），回执 `tier:"L2" / degraded:true`；
+文字走单路前台，`verified:true`，没有重复字符。
+
 ## 配置
 
 `cordis.patch.yml` 里给 `live-screen` 加 config：
