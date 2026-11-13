@@ -1,6 +1,6 @@
 {
   "name": "dsh-live-screen",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Isolated window workspaces for the local Windows desktop in DeepSeek Harness: per-window capture, background injection with foreground fallback, control lease arbitration, and a live preview panel.",
   "type": "module",
   "main": "lib/index.js",

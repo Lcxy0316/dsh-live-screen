@@ -54,7 +54,8 @@ const registered = { tools: [], http: [], upgrade: [], effects: [], injected: []
 const fakeWebServer = {
   port: 0,
   protocol: 'http:',
-  getOrigin() { return 'http://127.0.0.1:0' },
+  // 真 webServer 在 listen 之后才报得出 port；这里跟着真实 http server 走。
+  getOrigin() { return `http://127.0.0.1:${server.address()?.port ?? 0}` },
   register(route) { registered.http.push(route); return () => { registered.http = registered.http.filter((r) => r !== route) } },
   registerUpgrade(route) { registered.upgrade.push(route); return () => { registered.upgrade = registered.upgrade.filter((r) => r !== route) } },
 }
@@ -111,6 +112,16 @@ const postJson = (path, payload) => getJson(path, {
   headers: { 'content-type': 'application/json' },
   body: JSON.stringify(payload)
 })
+
+/* ---------------- 端点自述（Desktop 页面靠它拿真 origin） ---------------- */
+const endpointRes = await getJson('/endpoint')
+check('GET /endpoint 200', endpointRes.status === 200, String(endpointRes.status))
+check(
+  '/endpoint 报出本机 origin',
+  endpointRes.body?.ok === true && endpointRes.body?.origin === `http://127.0.0.1:${port}`,
+  JSON.stringify(endpointRes.body),
+)
+check('/endpoint 报出 ws 路径', endpointRes.body?.wsPath === '/live-screen/ws', String(endpointRes.body?.wsPath))
 
 /* ---------------- 挑一个真实窗口 ---------------- */
 const listRes = await getJson('/list')
@@ -278,10 +289,41 @@ ws.send(JSON.stringify({ type: 'windows' }))
 const windowsMsg = await waitText((m) => m.type === 'windows')
 check('WS windows 返回窗口清单', Array.isArray(windowsMsg?.windows) && windowsMsg.windows.length >= 1, JSON.stringify(windowsMsg).slice(0, 160))
 
+/**
+ * 等用户安静下来。
+ *
+ * 这个脚本跑在真实交互桌面上：只要有人在动鼠标键盘，租约就会按设计把控制权
+ * 判给用户，AI 的动作被 `preempted-by-user` 拒掉——那是正确行为，不是缺陷。
+ * 所以动手前先等空闲；等不到就把「动手」这段标成 SKIP，而不是把人的手算成 bug。
+ */
+async function waitForQuiet (timeoutMs = 12000) {
+  const deadline = Date.now() + timeoutMs
+  let last = null
+  while (Date.now() < deadline) {
+    const status = await fetch(`${base}/${wsB}/status`).then((r) => r.json()).catch(() => null)
+    const lease = status?.lease
+    last = lease
+    // 光看 idleMs 不够：用户刚动过的那一次已经把持有者打成 user，
+    // 要等它自己的 TTL 到期把控制权还回来，AI 才能合法动手。
+    if (typeof lease?.idleMs === 'number' && lease.idleMs >= 1200 && lease.holder !== 'user') return lease
+    await sleep(200)
+  }
+  return null
+}
+
+const quiet = await waitForQuiet()
+log(quiet ? '  桌面安静，可以验证动手' : '  桌面正被人使用，动手相关断言将跳过')
+
 ws.send(JSON.stringify({ type: 'act', action: { type: 'move', x: 30, y: 30 } }))
 const actMsg = await waitText((m) => m.type === 'result')
-check('WS act 有 result 回包', actMsg?.result?.ok === true, JSON.stringify(actMsg).slice(0, 200))
-check('WS act 回执带 verified', typeof actMsg?.result?.verified === 'boolean', JSON.stringify(actMsg?.result).slice(0, 160))
+if (quiet) {
+  check('WS act 有 result 回包', actMsg?.result?.ok === true, JSON.stringify(actMsg).slice(0, 200))
+  check('WS act 回执带 verified', typeof actMsg?.result?.verified === 'boolean', JSON.stringify(actMsg?.result).slice(0, 160))
+} else if (actMsg?.result?.error === 'preempted-by-user') {
+  log('[verify] SKIP WS act 被自己的主人抢占（人在用电脑，这是对的）')
+} else {
+  check('WS act 有 result 回包', actMsg?.result?.ok === true, JSON.stringify(actMsg).slice(0, 200))
+}
 
 ws.send(JSON.stringify({ type: 'lease-acquire' }))
 const leaseMsg = await waitText((m) => m.type === 'lease')

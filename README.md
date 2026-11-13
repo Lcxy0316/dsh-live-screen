@@ -13,7 +13,7 @@ AI 在窗口 A 里点按钮时，你可以照常操作窗口 B —— 它不抢�
 | 侧边栏面板 | Harness 左侧「实时画面」图标 | 盯着 AI 干活，随时接管，看得见谁持有控制权 |
 | 实时帧流 | `WS /live-screen/ws?id=<工作台>`（同源） | JPEG 帧下行 + 动作/租约上行 |
 | 模型工具 | `live_screen` | `list` / `open` / `snapshot` / `act` / `lease` / `close` / `stats` |
-| HTTP | `/live-screen/{stats,list,windows,workspaces,build}` 与 `/<wsId>/{snapshot,status,lease,act,open}` | 脚本 / 外部集成 |
+| HTTP | `/live-screen/{endpoint,stats,list,windows,workspaces,build}` 与 `/<wsId>/{snapshot,status,lease,act,open}` | 脚本 / 外部集成 |
 
 ## 架构
 
@@ -48,7 +48,11 @@ AI 在窗口 A 里点按钮时，你可以照常操作窗口 B —— 它不抢�
   或键盘，100ms 探针看到 `GetLastInputInfo` 归零立刻吊销，AI 的动作当场返回
   `preempted-by-user`，面板顶部变黄横幅提示。
 - **传输同源。** `webserver.registerUpgrade()` 把原始 socket 交给插件自己的 RFC6455 实现，
-  页面直接连 `ws://<harness-host>/live-screen/ws`，无 CSP、无混合内容、无额外端口。
+  页面直接连 `<harness-origin>/live-screen/ws`，无 CSP、无混合内容、无额外端口。
+  注意 Desktop 端把页面挂在 `dsh-app://app/`，`location.host` 是单标签的 `app`
+  （拿它拼地址会得到 `ws://app/...`，永远连不上）。所以客户端先问
+  `GET /live-screen/endpoint` 拿到宿主自报的 `http://127.0.0.1:<port>`，再拼 WebSocket；
+  连不上时 8s 超时会把**实际尝试过的 URL** 打到面板错误行里。
 - **零运行时依赖。** WebSocket 手写（`lib/ws.js`），图像是 JPEG，浏览器 `createImageBitmap` 解码。
 
 ## 隔离能力实测（本机 11 个窗口，`native/Probe.cs`）
@@ -121,7 +125,7 @@ powershell -File scripts\build-native.ps1 -Target All  # DesktopHost + Probe
 四个自检脚本，都不依赖 Harness 运行时：
 
 ```powershell
-node scripts\verify-workspace.mjs  # 租约状态机 + 工作台端到端（31 项，含真窗口点击）
+node scripts\verify-workspace.mjs  # 租约状态机 + 工作台端到端（32 项，含真窗口点击）
 node scripts\verify-host.mjs       # 路由 / WS / 工具 / 动作分发 / 空闲回收
 node scripts\verify-client.mjs     # slot 注册形状、渲染树、主题 token、字典完整性
 node scripts\verify-ui.mjs <url>   # 真 Harness 页面：面板真的渲染出来了吗（需 Edge）
