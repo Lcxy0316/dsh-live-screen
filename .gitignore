@@ -15,3 +15,4 @@ Thumbs.db
 
 # 文档配图要入库
 !docs/*.png
+!docs/*.jpg

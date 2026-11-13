@@ -83,6 +83,26 @@ static class DesktopHost
     [StructLayout(LayoutKind.Sequential)]
     struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
 
+    // CharSet.Unicode 不能用默认值：默认按 ANSI 封送字符串字段，而 CreateProcessW
+    // 按 UTF-16 解读 lpDesktop，于是得到一个不存在的桌面名 —— 进程能起来但
+    // user32 初始化失败，退出码 0xC0000142 (STATUS_DLL_INIT_FAILED)。
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct STARTUPINFO
+    {
+        public int cb;
+        public string lpReserved, lpDesktop, lpTitle;
+        public int dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
+        public short wShowWindow, cbReserved2;
+        public IntPtr lpReserved2, hStdInput, hStdOutput, hStdError;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct PROCESS_INFORMATION
+    {
+        public IntPtr hProcess, hThread;
+        public int dwProcessId, dwThreadId;
+    }
+
     delegate bool EnumProc(IntPtr h, IntPtr p);
 
     [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr p);
@@ -116,6 +136,31 @@ static class DesktopHost
     [DllImport("user32.dll")] static extern bool IsWindow(IntPtr h);
     [DllImport("user32.dll")] static extern bool IsWindowEnabled(IntPtr h);
     [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr h, uint cmd);
+
+    // ── 私有桌面（v3 T2 隔离）─────────────────────────────────────────────
+    // 目标：在用户看不见的地方开一个「自己的桌面」，进程跑在里面，
+    // AI 的点击/打字只落到那里，用户的真鼠标和前台窗口一动不动。
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern IntPtr CreateDesktopW(string name, IntPtr device, IntPtr devmode, int flags, uint access, IntPtr sa);
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern bool CloseDesktop(IntPtr h);
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern bool SwitchDesktop(IntPtr h);
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern IntPtr OpenInputDesktop(int flags, bool inherit, uint access);
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern bool SetThreadDesktop(IntPtr h);
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern bool EnumDesktopWindows(IntPtr desk, EnumProc cb, IntPtr p);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern bool CreateProcessW(string app, string cmd, IntPtr pa, IntPtr ta, bool inherit, uint flags,
+        IntPtr env, string cwd, ref STARTUPINFO si, out PROCESS_INFORMATION pi);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool GetExitCodeProcess(IntPtr h, out uint code);
+    [DllImport("kernel32.dll")]
+    static extern uint WaitForSingleObject(IntPtr h, uint ms);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool TerminateProcess(IntPtr h, uint code);
 
     [DllImport("gdi32.dll")] static extern IntPtr CreateCompatibleDC(IntPtr dc);
     [DllImport("gdi32.dll")] static extern IntPtr CreateDIBSection(IntPtr dc, ref BITMAPINFO bmi, uint usage, out IntPtr bits, IntPtr hSection, uint offset);
@@ -202,6 +247,223 @@ static class DesktopHost
     }
 
     // ── 窗口枚举 ─────────────────────────────────────────────────────────────
+    // ── 私有桌面 ─────────────────────────────────────────────────────────────
+    // 一个 DeskScope = 一个用 CreateDesktopW 开出来的桌面 + 一个绑在上面的工作线程。
+    // 所有「往那个桌面投递消息」的操作都必须在这个工作线程上做：
+    // PostMessage 跨桌面会被静默丢弃（不报错，画面就是不变），这是 v3 最隐蔽的坑。
+    class DeskScope
+    {
+        public string Name = "";
+        public IntPtr Desk = IntPtr.Zero;
+        public bool Bound;
+        public int BindError;
+        public string LastError = "";
+        public readonly List<IntPtr> Processes = new List<IntPtr>();
+        public readonly List<int> Pids = new List<int>();
+        public int PointerX, PointerY;      // AI 在这个桌面里的逻辑光标
+        public bool TakenOver;
+        IntPtr _back = IntPtr.Zero;
+
+        readonly Queue<Action> _q = new Queue<Action>();
+        Thread _worker;
+        bool _stop;
+
+        public bool Create(string name)
+        {
+            Name = string.IsNullOrEmpty(name) ? ("lsa-" + Environment.TickCount.ToString("x")) : name;
+            Desk = CreateDesktopW(Name, IntPtr.Zero, IntPtr.Zero, 0, 0x10000000 /*GENERIC_ALL*/, IntPtr.Zero);
+            if (Desk == IntPtr.Zero) { LastError = "create-failed:" + Marshal.GetLastWin32Error(); return false; }
+            _back = OpenInputDesktop(0, false, 0x01FF);
+            _worker = new Thread(Loop);
+            _worker.IsBackground = true;
+            _worker.Start();
+            // 等工作线程完成 SetThreadDesktop，否则第一批注入可能落到用户桌面上。
+            for (int i = 0; i < 100 && !Bound && BindError == 0; i++) Thread.Sleep(10);
+            if (!Bound) { LastError = "bind-failed:" + BindError; return false; }
+            return true;
+        }
+
+        void Loop()
+        {
+            Bound = SetThreadDesktop(Desk);
+            if (!Bound) { BindError = Marshal.GetLastWin32Error(); return; }
+            while (true)
+            {
+                Action a = null;
+                lock (_q)
+                {
+                    while (_q.Count == 0 && !_stop) Monitor.Wait(_q);
+                    if (_stop) return;
+                    a = _q.Dequeue();
+                }
+                try { a(); } catch { }
+            }
+        }
+
+        /// 在私有桌面的线程上执行；超时返回 false（绝不无限等，避免卡住采集循环）。
+        public bool Run(Action body, int timeoutMs = 4000)
+        {
+            if (Desk == IntPtr.Zero) { body(); return true; }
+            if (!Bound) return false;
+            var done = new ManualResetEventSlim(false);
+            lock (_q) { _q.Enqueue(delegate { try { body(); } finally { done.Set(); } }); Monitor.Pulse(_q); }
+            bool ok = done.Wait(timeoutMs);
+            done.Dispose();
+            return ok;
+        }
+
+        public T Eval<T>(Func<T> body, T fallback, int timeoutMs = 4000)
+        {
+            T result = fallback;
+            Run(delegate { result = body(); }, timeoutMs);
+            return result;
+        }
+
+        public bool Spawn(string exe, string args)
+        {
+            string full = ResolveExe(exe);
+            if (full == null) { LastError = "exe-not-found"; return false; }
+            var si = new STARTUPINFO();
+            si.cb = Marshal.SizeOf(typeof(STARTUPINFO));
+            si.lpDesktop = "winsta0\\" + Name;
+            PROCESS_INFORMATION pi;
+            string inner = string.IsNullOrEmpty(args) ? "\"" + full + "\"" : "\"" + full + "\" " + args;
+            // 必须经 cmd.exe 中转。Chromium 系（Edge / Electron / 豆包）会用 ShellExecute
+            // 自重启，直接从宿主 CreateProcess 时子进程落到用户桌面上、启动器自己退出 0x15。
+            // 经 cmd 中转后子进程继承 cmd 的桌面 = 私有桌面，实测 Edge 正常起窗。
+            string shell = Path.Combine(Environment.SystemDirectory, "cmd.exe");
+            string cmd = "\"" + shell + "\" /c " + inner;
+            bool ok = CreateProcessW(shell, cmd, IntPtr.Zero, IntPtr.Zero, false,
+                0x00000010 /*CREATE_NEW_CONSOLE：给 cmd 一个自己的控制台，在私有桌面上，用户看不见*/,
+                IntPtr.Zero, null, ref si, out pi);
+            if (!ok) { LastError = "spawn-failed:" + Marshal.GetLastWin32Error(); return false; }
+            CloseHandle(pi.hThread);
+            // cmd 立刻退出说明那条命令行根本没跑起来（引号/路径问题），要把退出码摊出来，
+            // 否则外面只会看到「ok:true 但桌面上什么都没有」。
+            if (WaitForSingleObject(pi.hProcess, 1200) == 0)
+            {
+                uint code;
+                GetExitCodeProcess(pi.hProcess, out code);
+                CloseHandle(pi.hProcess);
+                LastError = "shell-exited:0x" + code.ToString("x") + " cmdline=" + inner;
+                return false;
+            }
+            Processes.Add(pi.hProcess); Pids.Add(pi.dwProcessId);
+            return true;
+        }
+
+        public List<Win> Windows(bool visibleOnly)
+        {
+            var list = new List<Win>();
+            if (Desk == IntPtr.Zero) return list;
+            EnumDesktopWindows(Desk, delegate(IntPtr h, IntPtr p)
+            {
+                if (visibleOnly && !IsWindowVisible(h)) return true;
+                if (!IsWindow(h)) return true;
+                RECT r;
+                if (!GetWindowRect(h, out r)) return true;
+                int w = r.Right - r.Left, hh = r.Bottom - r.Top;
+                if (w < 80 || hh < 60) return true;
+                int len = GetWindowTextLengthW(h);
+                var sb = new StringBuilder(Math.Max(len + 1, 8));
+                GetWindowTextW(h, sb, sb.Capacity);
+                var cls = new StringBuilder(256);
+                GetClassNameW(h, cls, cls.Capacity);
+                uint pid; GetWindowThreadProcessId(h, out pid);
+                var win = new Win();
+                win.Hwnd = h; win.Title = sb.ToString(); win.Cls = cls.ToString(); win.Pid = pid;
+                win.X = r.Left; win.Y = r.Top; win.W = w; win.H = hh;
+                win.Minimized = IsIconic(h); win.Cloaked = false; win.Enabled = IsWindowEnabled(h);
+                list.Add(win);
+                return true;
+            }, IntPtr.Zero);
+            return list;
+        }
+
+        public IntPtr Foreground()
+        {
+            return Eval<IntPtr>(delegate { return GetForegroundWindow(); }, IntPtr.Zero);
+        }
+
+        /// 逻辑光标位置命中的窗口（z-order 顶在前，第一个包含该点的就是目标）。
+        public IntPtr HitTest(int x, int y)
+        {
+            foreach (var w in Windows(true))
+            {
+                if (w.Minimized) continue;
+                if (x >= w.X && y >= w.Y && x < w.X + w.W && y < w.Y + w.H) return w.Hwnd;
+            }
+            return IntPtr.Zero;
+        }
+
+        /// 把用户切到这个桌面（接管）：SwitchDesktop 换输入桌面，SetThreadDesktop 换线程绑定，
+        /// 两者都做，SendInput 才会被接受（实测只做前者仍然 ACCESS_DENIED）。
+        public bool Takeover()
+        {
+            if (Desk == IntPtr.Zero) return false;
+            bool ok = false;
+            var t = new Thread(delegate()
+            {
+                if (!SwitchDesktop(Desk)) { LastError = "switch:" + Marshal.GetLastWin32Error(); return; }
+                Thread.Sleep(150);
+                if (!SetThreadDesktop(Desk)) { LastError = "bind:" + Marshal.GetLastWin32Error(); return; }
+                ok = true;
+            });
+            t.IsBackground = true;
+            t.Start();
+            if (!t.Join(3000)) { LastError = "takeover-timeout"; return false; }
+            TakenOver = ok;
+            if (ok) HoldBackFor(8000);
+            return ok;
+        }
+
+        /// 安全网：接管期间如果调用方崩了，8 秒后自动把用户放回自己的桌面。
+        void HoldBackFor(int ms)
+        {
+            IntPtr back = _back;
+            var guard = new Thread(delegate()
+            {
+                Thread.Sleep(ms);
+                if (TakenOver && back != IntPtr.Zero) { SwitchDesktop(back); TakenOver = false; }
+            });
+            guard.IsBackground = true;
+            guard.Start();
+        }
+
+        public bool Release()
+        {
+            if (!TakenOver) return true;
+            bool ok = _back != IntPtr.Zero && SwitchDesktop(_back);
+            TakenOver = false;
+            return ok;
+        }
+
+        public void Close()
+        {
+            Release();
+            // 子进程是 cmd.exe 的孩子，TerminateProcess(cmd) 不会带走它 ——
+            // 所以先把私有桌面上的窗口所属进程杀掉，再收尾。
+            try
+            {
+                foreach (var w in Windows(false))
+                {
+                    if (w.Pid == 0) continue;
+                    try { Process.GetProcessById((int)w.Pid).Kill(); } catch { }
+                }
+            }
+            catch { }
+            foreach (var h in Processes)
+            {
+                try { TerminateProcess(h, 0); } catch { }
+                try { CloseHandle(h); } catch { }
+            }
+            Processes.Clear();
+            lock (_q) { _stop = true; Monitor.Pulse(_q); }
+            if (Desk != IntPtr.Zero) { try { CloseDesktop(Desk); } catch { } Desk = IntPtr.Zero; }
+            if (_back != IntPtr.Zero) { try { CloseDesktop(_back); } catch { } _back = IntPtr.Zero; }
+        }
+    }
+
     class Win
     {
         public IntPtr Hwnd;
@@ -214,6 +476,9 @@ static class DesktopHost
 
     static List<Win> Enumerate(bool visibleOnly)
     {
+        // 开了私有桌面就只枚举那个桌面上的窗口 —— 用户桌面的窗口对 AI 不可见，
+        // 这样「绑定目标」永远不会误绑到用户自己正在用的东西上。
+        if (_desk != null && _desk.Desk != IntPtr.Zero) return _desk.Windows(visibleOnly);
         var list = new List<Win>();
         EnumWindows(delegate(IntPtr h, IntPtr p)
         {
@@ -260,6 +525,7 @@ static class DesktopHost
     {
         public int Fps = 12;
         public int Quality = 55;
+        public int Mean;                    // 最近一帧的平均亮度 0..255（整桌面合成模式下采样得出）
         public bool Attached { get { return _attached; } }
         public bool IsScreen { get { return _screen; } }
         public int W { get { return _w; } }
@@ -271,6 +537,8 @@ static class DesktopHost
 
         IntPtr _hwnd = IntPtr.Zero;
         bool _screen;
+        bool _deskMode;
+        byte[] _comp;
         bool _attached;
         int _w, _h, _seq, _cols, _rows;
         IntPtr _memDc = IntPtr.Zero, _dib = IntPtr.Zero, _bits = IntPtr.Zero, _old = IntPtr.Zero, _srcDc = IntPtr.Zero;
@@ -298,6 +566,7 @@ static class DesktopHost
             var win = Find(hwnd);
             if (win == null) return false;
             _screen = false;
+            _deskMode = false;
             _hwnd = hwnd;
             _srcDc = IntPtr.Zero;
             _w = win.W;
@@ -305,6 +574,114 @@ static class DesktopHost
             _attached = Alloc();
             if (!_attached) Detach();
             return _attached;
+        }
+
+        /// 整桌面合成：后台桌面上的 GetDC(0) 没有合成表面（BitBlt 直接失败，实测），
+        /// 所以只能逐窗口 PrintWindow 再按 z-order 自己拼。
+        public bool AttachDesktop()
+        {
+            Detach();
+            _screen = false;
+            _deskMode = true;
+            _hwnd = IntPtr.Zero;
+            _srcDc = IntPtr.Zero;
+            _w = GetSystemMetrics(0);
+            _h = GetSystemMetrics(1);
+            _comp = new byte[_w * _h * 4];
+            _attached = Alloc();
+            if (!_attached) Detach();
+            return _attached;
+        }
+
+        class Layer
+        {
+            public IntPtr Hwnd, Dc, Dib, Bits, Old;
+            public int X, Y, W, H;
+            public long At;
+            public void Free()
+            {
+                if (Dib != IntPtr.Zero) { SelectObject(Dc, Old); DeleteObject(Dib); DeleteDC(Dc); Dib = IntPtr.Zero; Dc = IntPtr.Zero; Bits = IntPtr.Zero; }
+            }
+            public bool Ensure(int w, int h)
+            {
+                if (Dib != IntPtr.Zero && W == w && H == h) return true;
+                Free();
+                W = w; H = h;
+                IntPtr screen = GetDC(IntPtr.Zero);
+                Dc = CreateCompatibleDC(screen);
+                var bmi = new BITMAPINFO();
+                bmi.bmiHeader.biSize = Marshal.SizeOf(typeof(BITMAPINFOHEADER));
+                bmi.bmiHeader.biWidth = w;
+                bmi.bmiHeader.biHeight = -h;
+                bmi.bmiHeader.biPlanes = 1;
+                bmi.bmiHeader.biBitCount = 32;
+                bmi.bmiHeader.biCompression = 0;
+                Dib = CreateDIBSection(Dc, ref bmi, 0, out Bits, IntPtr.Zero, 0);
+                ReleaseDC(IntPtr.Zero, screen);
+                if (Dib == IntPtr.Zero) { DeleteDC(Dc); Dc = IntPtr.Zero; return false; }
+                Old = SelectObject(Dc, Dib);
+                return true;
+            }
+        }
+
+        readonly List<Layer> _layers = new List<Layer>();
+
+        bool GrabDesktop()
+        {
+            var wins = Enumerate(true);
+            long now = Environment.TickCount;
+            IntPtr fg = (_desk != null) ? _desk.Foreground() : GetForegroundWindow();
+
+            // 缓存策略：焦点窗口每帧重采（它在变），其它窗口 1 秒一次（静态，省 CPU）。
+            foreach (var w in wins)
+            {
+                var layer = null as Layer;
+                foreach (var l in _layers) if (l.Hwnd == w.Hwnd) { layer = l; break; }
+                if (layer == null) { layer = new Layer(); layer.Hwnd = w.Hwnd; _layers.Add(layer); }
+                bool isFg = w.Hwnd == fg;
+                if (!isFg && layer.Dib != IntPtr.Zero && now - layer.At < 1000) { layer.X = w.X; layer.Y = w.Y; continue; }
+                if (!layer.Ensure(w.W, w.H)) continue;
+                for (int i = 0; i < w.W * w.H; i++) Marshal.WriteInt32(layer.Bits, i * 4, 0);
+                PrintWindow(w.Hwnd, layer.Dc, PW_RENDERFULLCONTENT);
+                layer.At = now; layer.X = w.X; layer.Y = w.Y;
+            }
+
+            // 合成：EnumDesktopWindows 是 z-order 顶在前，所以从尾部（最底）往头画。
+            int stride = _w * 4;
+            for (int i = 0; i < _comp.Length; i += 4)
+            {
+                _comp[i] = 0x22; _comp[i + 1] = 0x1E; _comp[i + 2] = 0x1A; _comp[i + 3] = 0xFF;  // BGR 深色底
+            }
+            for (int wi = wins.Count - 1; wi >= 0; wi--)
+            {
+                var l = null as Layer;
+                foreach (var c in _layers) if (c.Hwnd == wins[wi].Hwnd) { l = c; break; }
+                if (l == null || l.Dib == IntPtr.Zero) continue;
+                IntPtr bits = l.Bits;
+                // 逐行拷贝 + 目标矩形裁剪（窗口可能超出屏幕 / 被拖到负坐标）
+                int srcX = 0, srcY = 0, dstX = l.X, dstY = l.Y, cw = l.W, ch = l.H;
+                if (dstX < 0) { srcX = -dstX; cw += dstX; dstX = 0; }
+                if (dstY < 0) { srcY = -dstY; ch += dstY; dstY = 0; }
+                if (dstX + cw > _w) cw = _w - dstX;
+                if (dstY + ch > _h) ch = _h - dstY;
+                if (cw <= 0 || ch <= 0) continue;
+                var rowBuf = new byte[cw * 4];
+                for (int y = 0; y < ch; y++)
+                {
+                    Marshal.Copy((IntPtr)(bits.ToInt64() + ((long)(srcY + y) * l.W + srcX) * 4), rowBuf, 0, cw * 4);
+                    Buffer.BlockCopy(rowBuf, 0, _comp, ((dstY + y) * _w + dstX) * 4, cw * 4);
+                }
+            }
+            Marshal.Copy(_comp, 0, _bits, _comp.Length);
+            // 亮度采样：Chromium 系在后台桌面上不做合成，PrintWindow 会给出近黑表面，
+            // 有了这个数字才能判断「到底采到了东西还是黑屏」。
+            long sum = 0; int n = 0;
+            for (int i = 0; i < _comp.Length; i += 4 * 37)
+            {
+                sum += (_comp[i] + _comp[i + 1] + _comp[i + 2]) / 3; n++;
+            }
+            Mean = n > 0 ? (int)(sum / n) : 0;
+            return true;
         }
 
         bool Alloc()
@@ -350,7 +727,10 @@ static class DesktopHost
             if (_dib != IntPtr.Zero) { DeleteObject(_dib); _dib = IntPtr.Zero; }
             if (_memDc != IntPtr.Zero) { DeleteDC(_memDc); _memDc = IntPtr.Zero; }
             if (_srcDc != IntPtr.Zero) { ReleaseDC(IntPtr.Zero, _srcDc); _srcDc = IntPtr.Zero; }
-            _hwnd = IntPtr.Zero; _screen = false; _attached = false;
+            foreach (var l in _layers) l.Free();
+            _layers.Clear();
+            _comp = null;
+            _hwnd = IntPtr.Zero; _screen = false; _deskMode = false; _attached = false;
             _lastTiles = null;
         }
 
@@ -359,6 +739,7 @@ static class DesktopHost
         public bool Grab()
         {
             if (_dib == IntPtr.Zero) return false;
+            if (_deskMode) return GrabDesktop();
             if (_screen)
             {
                 bool ok = BitBlt(_memDc, 0, 0, _w, _h, _srcDc, 0, 0, 0x00CC0020);
@@ -699,10 +1080,23 @@ static class DesktopHost
     {
         var sb = new StringBuilder();
         sb.Append("{\"t\":" + Environment.TickCount);
-        var fg = GetForegroundWindow();
+        // 私有桌面模式下，「前台」和「光标」都是那个桌面的，不是用户桌面的。
+        var fg = (_desk != null && _desk.Desk != IntPtr.Zero) ? _desk.Foreground() : GetForegroundWindow();
         sb.Append(",\"foreground\":\"0x" + fg.ToInt64().ToString("x") + "\"");
-        POINT p; GetCursorPos(out p);
-        sb.Append(",\"cursor\":{\"x\":" + p.X + ",\"y\":" + p.Y + "}");
+        if (_desk != null && _desk.Desk != IntPtr.Zero)
+        {
+            sb.Append(",\"cursor\":{\"x\":" + _desk.PointerX + ",\"y\":" + _desk.PointerY + ",\"virtual\":true}");
+            sb.Append(",\"desk\":{\"name\":\"" + Esc(_desk.Name) + "\""
+                + ",\"hwnd\":\"0x" + _desk.Desk.ToInt64().ToString("x") + "\""
+                + ",\"bound\":" + (_desk.Bound ? "true" : "false")
+                + ",\"takenOver\":" + (_desk.TakenOver ? "true" : "false")
+                + ",\"pids\":" + _desk.Pids.Count + "}");
+        }
+        else
+        {
+            POINT p; GetCursorPos(out p);
+            sb.Append(",\"cursor\":{\"x\":" + p.X + ",\"y\":" + p.Y + "}");
+        }
         // 空闲时长：用户多久没动过真鼠标/键盘。ControlLease 用它判断是否被用户抢占。
         var lii = new LASTINPUTINFO(); lii.cbSize = (uint)Marshal.SizeOf(typeof(LASTINPUTINFO));
         if (GetLastInputInfo(ref lii))
@@ -713,7 +1107,7 @@ static class DesktopHost
         sb.Append(",\"target\":\"0x" + target.ToInt64().ToString("x") + "\"");
         if (cap != null && cap.Attached)
         {
-            sb.Append(",\"capture\":{\"w\":" + cap.W + ",\"h\":" + cap.H + ",\"seq\":" + cap.Seq + ",\"screen\":" + (cap.IsScreen ? "true" : "false") + "}");
+            sb.Append(",\"capture\":{\"w\":" + cap.W + ",\"h\":" + cap.H + ",\"seq\":" + cap.Seq + ",\"screen\":" + (cap.IsScreen ? "true" : "false") + ",\"mean\":" + cap.Mean + "}");
             var tiles = cap.LastTiles;
             if (tiles != null)
             {
@@ -767,6 +1161,7 @@ static class DesktopHost
 
     // ── 主循环 ───────────────────────────────────────────────────────────────
     static Capturer _cap = new Capturer();
+    static DeskScope _desk;             // 非 null 时：采集与注入都限定在这个私有桌面里
     static IntPtr _target = IntPtr.Zero;
     static volatile bool _running = true;
     static readonly ManualResetEventSlim _wake = new ManualResetEventSlim(false);
@@ -851,8 +1246,49 @@ static class DesktopHost
         }
         _running = false;
         _wake.Set();
+        if (_desk != null) { try { _desk.Close(); } catch { } _desk = null; }
         _cap.Dispose();
         return 0;
+    }
+
+    // 注入路由：有私有桌面时，所有消息必须从「绑在那个桌面上的线程」发出，
+// 否则 PostMessage 会被系统静默丢弃（不报错，只是画面永远不变）。
+    /**
+     * 当前该对谁动手：私有桌面里是那个桌面的前台窗口，否则是绑定的窗口。
+     * 只能在桌面线程之外调用（内部会 Run 到桌面线程，桌面线程上再调会自锁）。
+     */
+    static IntPtr ActionTarget()
+    {
+        if (_desk != null && _desk.Desk != IntPtr.Zero)
+        {
+            IntPtr fg = IntPtr.Zero;
+            _desk.Run(delegate
+            {
+                fg = GetForegroundWindow();
+                // 私有桌面上常常「没有前台窗口」（没人激活过它），退回最上层可见窗口。
+                if (fg == IntPtr.Zero)
+                {
+                    var wins = _desk.Windows(true);
+                    if (wins.Count > 0) fg = wins[0].Hwnd;
+                }
+            });
+            return fg;
+        }
+        return _target;
+    }
+
+    static string Route(Func<string> fn)
+    {
+        if (_desk == null || _desk.Desk == IntPtr.Zero) return fn();
+        string r = "inject-timeout";
+        _desk.Run(delegate { r = fn(); });
+        return r;
+    }
+
+    static void RouteVoid(Action fn)
+    {
+        if (_desk == null || _desk.Desk == IntPtr.Zero) { fn(); return; }
+        _desk.Run(fn);
     }
 
     // 返回 false 表示退出
@@ -866,6 +1302,81 @@ static class DesktopHost
         {
             case "QUIT":
                 return false;
+
+            // ── 私有桌面控制（v3 T2）──────────────────────────────────────
+            case "DESK":
+            {
+                string sub = rest.Trim();
+                string arg = "";
+                int spp = sub.IndexOf(' ');
+                if (spp > 0) { arg = sub.Substring(spp + 1); sub = sub.Substring(0, spp); }
+                switch (sub.ToUpperInvariant())
+                {
+                    case "NEW":
+                    {
+                        if (_desk != null) { _desk.Close(); _desk = null; }
+                        var d = new DeskScope();
+                        bool ok = d.Create(arg.Trim());
+                        _desk = ok ? d : null;
+                        // 新桌面就绪后立刻切到「整桌面合成」模式，这样面板看到的是整个虚拟桌面。
+                        if (ok)
+                        {
+                            _target = IntPtr.Zero;
+                            _cap.AttachDesktop();
+                            _forceNext = true;
+                        }
+                        WriteJson("{\"type\":\"desk\",\"ok\":" + (ok ? "true" : "false")
+                            + ",\"name\":\"" + Esc(d.Name) + "\""
+                            + ",\"hwnd\":\"0x" + d.Desk.ToInt64().ToString("x") + "\""
+                            + ",\"error\":\"" + Esc(ok ? "" : d.LastError) + "\""
+                            + ",\"w\":" + _cap.W + ",\"h\":" + _cap.H + "}");
+                        return true;
+                    }
+                    case "SPAWN":
+                    {
+                        if (_desk == null) { WriteJson("{\"type\":\"spawn\",\"ok\":false,\"error\":\"no-desktop\"}"); return true; }
+                        var parts = arg.Split(new[] { '|' }, 2);
+                        string exe = parts[0].Trim();
+                        // '|' 是协议里的参数分隔符，必须换成空格 —— 否则 cmd 会把它当管道，
+                        // Edge 这类程序会以 0x1/0xff 静默退出（踩过一次）
+                        string a2 = parts.Length > 1 ? parts[1].Replace('|', ' ') : "";
+                        bool ok = _desk.Spawn(exe, a2);
+                        WriteJson("{\"type\":\"spawn\",\"ok\":" + (ok ? "true" : "false")
+                            + ",\"exe\":\"" + Esc(exe) + "\""
+                            + ",\"pid\":" + (_desk.Pids.Count > 0 ? _desk.Pids[_desk.Pids.Count - 1] : 0)
+                            + ",\"error\":\"" + Esc(ok ? "" : _desk.LastError) + "\"}");
+                        return true;
+                    }
+                    case "LIST":
+                        WriteJson("{\"type\":\"list\",\"desktop\":true,\"windows\":" + ListJson() + "}");
+                        return true;
+                    case "TAKEOWN":
+                    {
+                        if (_desk == null) { WriteJson("{\"type\":\"takeover\",\"ok\":false,\"error\":\"no-desktop\"}"); return true; }
+                        bool ok = _desk.Takeover();
+                        WriteJson("{\"type\":\"takeover\",\"ok\":" + (ok ? "true" : "false")
+                            + ",\"active\":true,\"error\":\"" + Esc(ok ? "" : _desk.LastError) + "\"}");
+                        return true;
+                    }
+                    case "RELEASE":
+                    {
+                        bool ok = _desk == null || _desk.Release();
+                        WriteJson("{\"type\":\"takeover\",\"ok\":" + (ok ? "true" : "false") + ",\"active\":false}");
+                        return true;
+                    }
+                    case "CLOSE":
+                    {
+                        if (_desk != null) { _desk.Close(); _desk = null; }
+                        _cap.Detach();
+                        _target = IntPtr.Zero;
+                        WriteJson("{\"type\":\"deskclosed\"}");
+                        return true;
+                    }
+                    default:
+                        WriteJson("{\"type\":\"error\",\"message\":\"unknown-desk-command\"}");
+                        return true;
+                }
+            }
 
             case "OPEN":
             {
@@ -935,14 +1446,27 @@ static class DesktopHost
                 //   -> 屏幕坐标 = 窗口左上 + 图像坐标（SendInput 用）
                 //   -> 客户区坐标 = 图像坐标 - (客户区左上 - 窗口左上)（PostMessage 用）
                 int sx = x, sy = y, cx = x, cy = y;
-                if (_target != IntPtr.Zero)
+                IntPtr hit = IntPtr.Zero;
+                if (_desk != null && _desk.Desk != IntPtr.Zero)
+                {
+                    // 私有桌面：按 z-order 找逻辑光标下最上面的窗口，再 PostMessage 到它。
+                    // 只有「接管中」（那个桌面成了输入桌面）才允许走 SendInput。
+                    hit = _desk.HitTest(x, y);
+                    if (hit == IntPtr.Zero) { WriteJson("{\"type\":\"result\",\"ok\":false,\"detail\":\"no-window-at-point\",\"x\":" + x + ",\"y\":" + y + "}"); return true; }
+                    RECT hr; GetWindowRect(hit, out hr);
+                    int hx, hy; ClientOffset(hit, out hx, out hy);
+                    cx = x - hr.Left - hx; cy = y - hr.Top - hy;
+                    _desk.PointerX = x; _desk.PointerY = y;
+                }
+                else if (_target != IntPtr.Zero)
                 {
                     RECT r; GetWindowRect(_target, out r);
                     int dx, dy; ClientOffset(_target, out dx, out dy);
                     sx = r.Left + x; sy = r.Top + y;
                     cx = x - dx; cy = y - dy;
                 }
-                string r2 = InjectClick(_target, cx, cy, sx, sy, btn, cmd == "CLICKF");
+                string r2 = Route(delegate { return InjectClick(hit != IntPtr.Zero ? hit : _target, cx, cy, sx, sy, btn, cmd == "CLICKF" || (hit != IntPtr.Zero && _desk.TakenOver)); });
+                if (_desk != null && _desk.Desk != IntPtr.Zero) { _desk.PointerX = sx; _desk.PointerY = sy; }
                 WriteJson("{\"type\":\"result\",\"ok\":" + (r2 == "ok" ? "true" : "false") + ",\"detail\":\"" + Esc(r2) + "\",\"x\":" + x + ",\"y\":" + y + ",\"tier\":\"" + (cmd == "CLICKF" ? "L2" : "L1") + "\"}");
                 return true;
             }
@@ -953,6 +1477,14 @@ static class DesktopHost
                 if (a.Length < 2) { WriteJson("{\"type\":\"result\",\"ok\":false,\"error\":\"bad-args\"}"); return true; }
                 int x = int.Parse(a[0], CultureInfo.InvariantCulture);
                 int y = int.Parse(a[1], CultureInfo.InvariantCulture);
+                if (_desk != null && _desk.Desk != IntPtr.Zero)
+                {
+                    // 私有桌面里真实光标是共享的（而且 SendInput 会被系统拒），
+                    // 所以「移动」只是移动我们自己的逻辑光标，面板画 ghost cursor 即可。
+                    _desk.PointerX = x; _desk.PointerY = y;
+                    WriteJson("{\"type\":\"result\",\"ok\":true,\"detail\":\"logical\",\"x\":" + x + ",\"y\":" + y + "}");
+                    return true;
+                }
                 int sx = x, sy = y, cx = x, cy = y;
                 if (_target != IntPtr.Zero)
                 {
@@ -961,8 +1493,11 @@ static class DesktopHost
                     sx = r.Left + x; sy = r.Top + y;
                     cx = x - dx; cy = y - dy;
                 }
-                string r3 = InjectMove(_target, cx, cy, sx, sy, false);
-                WriteJson("{\"type\":\"result\",\"ok\":" + (r3 == "ok" ? "true" : "false") + ",\"detail\":\"" + Esc(r3) + "\"}");
+                string r3 = Route(delegate { return InjectMove(_target, cx, cy, sx, sy, false); });
+                // 私有桌面里真实光标是共用的，所以我们自己记一个「AI 的逻辑光标」，
+                // 面板据此画 ghost cursor —— 这就是用户要的「独立鼠标」。
+                if (_desk != null && _desk.Desk != IntPtr.Zero) { _desk.PointerX = sx; _desk.PointerY = sy; }
+                WriteJson("{\"type\":\"result\",\"ok\":" + (r3 == "ok" ? "true" : "false") + ",\"detail\":\"" + Esc(r3) + "\",\"x\":" + sx + ",\"y\":" + sy + "}");
                 return true;
             }
 
@@ -975,7 +1510,7 @@ static class DesktopHost
                     RECT cr; GetClientRect(_target, out cr);
                     cx = cr.Right / 2; cy = cr.Bottom / 2;   // 滚到窗口中央，避免落在边缘
                 }
-                string r4 = InjectScroll(_target, cx, cy, dy, false);
+                string r4 = Route(delegate { return InjectScroll(_target, cx, cy, dy, false); });
                 WriteJson("{\"type\":\"result\",\"ok\":" + (r4 == "ok" ? "true" : "false") + ",\"detail\":\"" + Esc(r4) + "\"}");
                 return true;
             }
@@ -983,7 +1518,11 @@ static class DesktopHost
             case "TYPE":
             case "TYPEF":
             {
-                string r5 = InjectText(_target, rest, cmd == "TYPEF");
+                // 私有桌面里没有「绑定的窗口」，收键盘的是那个桌面的前台窗口。
+                // 必须在进 Route 之前解析：Route 内部就跑在桌面线程上，再调 Run 会自锁。
+                IntPtr tgt = ActionTarget();
+                bool forceType = cmd == "TYPEF" || (_desk != null && _desk.TakenOver);
+                string r5 = Route(delegate { return InjectText(tgt, rest, forceType); });
                 WriteJson("{\"type\":\"result\",\"ok\":" + (r5 == "ok" ? "true" : "false") + ",\"detail\":\"" + Esc(r5) + "\",\"chars\":" + rest.Length + "}");
                 return true;
             }
@@ -995,7 +1534,7 @@ static class DesktopHost
                 if (a.Length < 2) { WriteJson("{\"type\":\"result\",\"ok\":false,\"error\":\"bad-args\"}"); return true; }
                 int vk = int.Parse(a[0], CultureInfo.InvariantCulture);
                 bool down = a[1].ToLowerInvariant() == "d" || a[1].ToLowerInvariant() == "down";
-                string r6 = InjectKey(_target, vk, down, cmd == "KEYF");
+                string r6 = Route(delegate { return InjectKey(ActionTarget(), vk, down, cmd == "KEYF" || (_desk != null && _desk.TakenOver)); });
                 WriteJson("{\"type\":\"result\",\"ok\":" + (r6 == "ok" ? "true" : "false") + ",\"detail\":\"" + Esc(r6) + "\"}");
                 return true;
             }
@@ -1015,8 +1554,8 @@ static class DesktopHost
                     }
                 }
                 if (h2 == IntPtr.Zero) { WriteJson("{\"type\":\"result\",\"ok\":false,\"detail\":\"not-found\"}"); return true; }
-                ShowWindow(h2, 9);
-                SetForegroundWindow(h2);
+                // 私有桌面里「置前」也必须在那个桌面的线程上做，否则 SetForegroundWindow 静默无效。
+                RouteVoid(delegate { ShowWindow(h2, 9); SetForegroundWindow(h2); });
                 WriteJson("{\"type\":\"result\",\"ok\":true,\"hwnd\":\"0x" + h2.ToInt64().ToString("x") + "\"}");
                 return true;
             }

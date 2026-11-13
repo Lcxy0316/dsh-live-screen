@@ -1,7 +1,7 @@
 {
   "name": "dsh-live-screen",
-  "version": "0.2.2",
-  "description": "Isolated window workspaces for the local Windows desktop in DeepSeek Harness: per-window capture, background injection with foreground fallback, control lease arbitration, and a live preview panel.",
+  "version": "0.3.0",
+  "description": "Isolated window workspaces and a private virtual desktop (CreateDesktop) for the local Windows desktop in DeepSeek Harness: per-window or whole-desktop capture, logical cursor, background injection, control lease, and a live preview panel.",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -23,7 +23,9 @@
     "cordis.patch.yml",
     "docs/panel.png",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "native/DeskProbe.cs",
+    "docs/virtual-desktop.jpg"
   ],
   "scripts": {
     "build:native": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-native.ps1",

@@ -10,10 +10,30 @@ AI 在窗口 A 里点按钮时，你可以照常操作窗口 B —— 它不抢�
 
 | 通道 | 入口 | 用途 |
 | --- | --- | --- |
-| 侧边栏面板 | Harness 左侧「实时画面」图标 | 盯着 AI 干活，随时接管，看得见谁持有控制权 |
-| 实时帧流 | `WS /live-screen/ws?id=<工作台>`（同源） | JPEG 帧下行 + 动作/租约上行 |
-| 模型工具 | `live_screen` | `list` / `open` / `snapshot` / `act` / `lease` / `close` / `stats` |
-| HTTP | `/live-screen/{endpoint,stats,list,windows,workspaces,build}` 与 `/<wsId>/{snapshot,status,lease,act,open}` | 脚本 / 外部集成 |
+| 侧边栏面板 | Harness 左侧「实时画面」图标 | 盯着 AI 干活，随时接管，看得见谁持有控制权；虚拟桌面模式下还能看见 AI 的独立光标 |
+| 实时帧流 | `WS /live-screen/ws?id=<工作台>`（同源） | JPEG 帧下行 + 动作/租约/光标上行 |
+| 模型工具 | `live_screen` | `list` / `desk` / `takeover` / `open` / `snapshot` / `act` / `lease` / `close` / `stats` |
+| HTTP | `/live-screen/{endpoint,stats,list,windows,workspaces,build}` 与 `/<wsId>/{snapshot,status,lease,act,open,desk,takeover}` | 脚本 / 外部集成 |
+
+## 两种隔离模式
+
+| 模式 | 隔离程度 | 你能干什么 | 适合 |
+| --- | --- | --- | --- |
+| 窗口工作台（默认） | 采集隔离、注入半隔离 | 照常用电脑；AI 在后台往某个窗口投递 | 盯一个已有窗口（浏览器、播放器） |
+| **私有虚拟桌面（`desk`）** | **桌面级隔离** | 你的键鼠完全不被打扰；AI 在另一个 `CreateDesktop` 桌面里开进程、有独立光标 | 「把这件事交给 AI 自己搞完」，或进去亲手登录 |
+
+私有桌面的事实（本机实测，`native/DeskProbe.cs` + `scripts/desk-e2e.mjs`）：
+
+- 非管理员就能 `CreateDesktopW`；子进程用 `lpDesktop` 进入该桌面，**用户桌面上看不见它**。
+- 那个桌面里的 `SendInput` / `SetCursorPos` 一律被系统拒绝（`sendErr=5`），所以
+  **AI 的鼠标是我们自己记账的逻辑光标**，面板上画一个 ghost 光标把坐标显示给你；
+  你的真实光标一个像素都不动。
+- 整桌面画面靠「逐窗口 `PrintWindow` + 按 z-order 自己合成」（后台桌面没有合成表面，
+  `BitBlt(GetDC(0))` 取不到东西）。焦点窗口每帧重采，其它窗口 1 秒一次。
+- `takeover` 才做真正的 `SwitchDesktop`：你的屏幕全屏变成那个虚拟桌面，键鼠归它 ——
+  这是「AI 登录不了，我自己进去点两下」的入口，也是 `type` 唯一能生效的时候
+  （非输入桌面上 `SendInput` 被拒，`WM_CHAR` 对 Chromium 无效，此时回执如实给
+  `hint: "need-takeover"`）。
 
 ## 架构
 
@@ -181,6 +201,23 @@ node scripts\verify-ui.mjs <url>   # 真 Harness 页面：面板真的渲染出�
 { "action": "close", "workspace": "ws3-qo0gl" }
 ```
 
+### 用虚拟桌面（AI 自己在另一张桌面上干活）
+
+```jsonc
+// 开一张私有桌面，顺便在里面拉起 Edge（坐标用整屏 1920×1080）
+{ "action": "desk", "app": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+  "appArgs": ["--no-first-run", "--user-data-dir=C:\\Temp\\lsa-profile", "https://example.com"] }
+// → { "ok": true, "workspace": "ws7-2bz1k", "desk": { "name": "lsa-1f2c9a1", "width": 1920, "height": 1080 } }
+
+// 动手：clicks 命中窗口就用 PostMessage（你的光标不动）；move 只动逻辑光标
+{ "action": "act", "workspace": "ws7-2bz1k", "steps": [ { "type": "click", "x": 640, "y": 82 } ] }
+
+// 需要真人进去登录 → 把你的屏幕切到那张桌面
+{ "action": "takeover", "workspace": "ws7-2bz1k", "on": true }
+// 登录完交还
+{ "action": "takeover", "workspace": "ws7-2bz1k", "on": false }
+```
+
 动作类型：`move` `click` `scroll` `type` `key` `focus` `run` `quality` `wait`。
 坐标用 `snapshot` 返回图像里的像素（等于窗口坐标，含标题栏边框），面板已经换算好；
 手写脚本时不要再乘缩放。
@@ -241,6 +278,12 @@ node scripts\verify-ui.mjs <url>   # 真 Harness 页面：面板真的渲染出�
 - 高完整性（管理员）进程的窗口会被 UIPI 拦截，动作会明确报错而不是静默失败。
 - 需要交互式会话（`SESSIONNAME=Console`）。跑在服务里既抓不到窗口也投不进输入。
 - 独占全屏的 D3D 游戏窗口仍可能抓到黑屏（`PrintWindow` 的限制）。
+- 私有桌面（`desk`）里没有「真实鼠标」：`SendInput` 在非输入桌面上被系统拒绝，
+  所以鼠标是逻辑光标，只有 `takeover` 之后才落到真键鼠；`type` 同样要 `takeover`。
+- 私有桌面的进程**不会**随 `close` 之外的路径清理：面板点「关虚拟桌面」/ 工具 `close`
+  才会连带杀掉里面所有进程（宿主进程被杀时它们也会被枚举清理）。
+- 私有桌面是「同一会话的另一张桌面」，不是虚拟机：它共享你的用户权限、文件系统、网络。
+  要真隔离请用虚拟机（本机 16GB / 可用约 2GB，跑不动）。
 
 ## License
 
